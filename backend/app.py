@@ -1,16 +1,12 @@
-from flask import Flask, request, jsonify
-import requests
-import base64
-from typing import List, Dict, Set
+from quart import Quart, jsonify
+import aiohttp
+from typing import List, Dict
 import os
 import asyncio
-import aiohttp
 from concurrent.futures import ThreadPoolExecutor
 from dotenv import load_dotenv
 import time
-from functools import partial
 import logging
-from quart import Quart  # Changed from Flask to Quart
 
 # Load environment variables from .env
 load_dotenv()
@@ -19,7 +15,7 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = Quart(__name__)  # Changed from Flask to Quart
+app = Quart(__name__)
 
 class GitHubLOCCounter:
     def __init__(self):
@@ -220,10 +216,10 @@ async def count_authenticated_user_loc():
         # Add execution time to response
         total_stats['execution_time_seconds'] = round(time.time() - start_time, 2)
 
-        return jsonify(total_stats)
+        return jsonify(total_stats)  # Changed from app.make_response(jsonify())
     except Exception as e:
         logger.error(f"Error processing request: {str(e)}")
-        return jsonify({'error': str(e)}), 500
+        return jsonify({'error': str(e)}), 500  # Changed from app.make_response(jsonify())
 
 @app.route('/health', methods=['GET'])
 async def health_check():
