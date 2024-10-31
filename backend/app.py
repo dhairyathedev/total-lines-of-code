@@ -1,4 +1,4 @@
-from quart import Quart, jsonify
+from quart import Quart, jsonify, request
 import aiohttp
 from typing import List, Dict
 import os
@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dotenv import load_dotenv
 import time
 import logging
+import re
 
 # Load environment variables from .env
 load_dotenv()
@@ -18,12 +19,9 @@ logger = logging.getLogger(__name__)
 app = Quart(__name__)
 
 class GitHubLOCCounter:
-    def __init__(self):
+    def __init__(self, token: str):
         self.base_url = "https://api.github.com"
-        self.token = os.getenv('GITHUB_TOKEN')
-        if not self.token:
-            raise ValueError("GITHUB_TOKEN environment variable is required")
-
+        self.token = token
         self.headers = {
             "Accept": "application/vnd.github.v3+json",
             "Authorization": f"token {self.token}"
@@ -200,11 +198,29 @@ class GitHubLOCCounter:
 
         return total_stats
 
-@app.route('/count-my-loc', methods=['GET'])
+def is_valid_github_token(token: str) -> bool:
+    """Validate GitHub token format."""
+    # Basic validation for GitHub token format
+    pattern = r'^gh[ops]_[A-Za-z0-9_]{36,255}$'
+    return bool(re.match(pattern, token))
+
+@app.route('/count-my-loc', methods=['POST'])
 async def count_authenticated_user_loc():
     try:
+        # Get token from request body
+        request_data = await request.get_json()
+        
+        if not request_data or 'github_token' not in request_data:
+            return jsonify({'error': 'Missing github_token in request body'}), 400
+        
+        token = request_data['github_token']
+        
+        # Validate token format
+        if not is_valid_github_token(token):
+            return jsonify({'error': 'Invalid GitHub token format'}), 400
+
         start_time = time.time()
-        counter = GitHubLOCCounter()
+        counter = GitHubLOCCounter(token)
 
         # Get all repositories for authenticated user
         repos = await counter.get_authenticated_user_repos()
@@ -212,14 +228,22 @@ async def count_authenticated_user_loc():
 
         # Process repositories and get stats
         total_stats = await counter.process_repositories(repos)
-
-        # Add execution time to response
         total_stats['execution_time_seconds'] = round(time.time() - start_time, 2)
 
-        return jsonify(total_stats)  # Changed from app.make_response(jsonify())
+        return jsonify(total_stats)
+
     except Exception as e:
         logger.error(f"Error processing request: {str(e)}")
-        return jsonify({'error': str(e)}), 500  # Changed from app.make_response(jsonify())
+        return jsonify({'error': str(e)}), 500
+
+# Add security headers middleware
+@app.after_request
+def add_security_headers(response):
+    response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['X-Frame-Options'] = 'DENY'
+    response.headers['X-XSS-Protection'] = '1; mode=block'
+    return response
 
 @app.route('/health', methods=['GET'])
 async def health_check():
