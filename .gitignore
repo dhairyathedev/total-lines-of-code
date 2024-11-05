@@ -58,3 +58,6 @@ coverage.xml
 Thumbs.db
 .DS_Store
 
+# Misc
+storage/
+

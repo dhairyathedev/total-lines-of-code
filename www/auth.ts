@@ -6,7 +6,7 @@ declare module "next-auth/jwt" {
   interface JWT {
     accessToken?: string
     refreshToken?: string
-    username?: string
+    userId?: string
     accessTokenExpires?: number
     error?: string
   }
@@ -17,7 +17,7 @@ export const { handlers, signIn, signOut, auth } = NextAuth({
     clientId: process.env.GITHUB_ID,
     clientSecret: process.env.GITHUB_SECRET,
     authorization:{
-      params: { scope: "repo read:user read:email" }
+      params: { scope: "repo read:user" }
     }
   })],
   callbacks: {
@@ -28,7 +28,7 @@ export const { handlers, signIn, signOut, auth } = NextAuth({
           ...token,
           accessToken: account.access_token,
           refreshToken: account.refresh_token,
-          username: account.providerAccountId,
+          userId: account.providerAccountId,
           accessTokenExpires: account.expires_at * 1000,
         }
       }
@@ -44,7 +44,7 @@ export const { handlers, signIn, signOut, auth } = NextAuth({
     async session({ session, token }: { session: any, token: JWT }) {
       session.user.accessToken = token.accessToken
       session.user.refreshToken = token.refreshToken
-      session.user.username = token.username
+      session.user.userId = token.userId
 
       return session
     },
