@@ -1,13 +1,17 @@
-from quart import Quart, jsonify, request
+from quart import Quart, jsonify
 import aiohttp
-from typing import List, Dict
+from typing import List, Dict, Optional
 import os
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from dotenv import load_dotenv
 import time
 import logging
-import re
+import uuid
+from dataclasses import dataclass, asdict
+from enum import Enum
+from collections import deque
+import threading
 
 # Load environment variables from .env
 load_dotenv()
@@ -18,236 +22,192 @@ logger = logging.getLogger(__name__)
 
 app = Quart(__name__)
 
-class GitHubLOCCounter:
-    def __init__(self, token: str):
-        self.base_url = "https://api.github.com"
-        self.token = token
-        self.headers = {
-            "Accept": "application/vnd.github.v3+json",
-            "Authorization": f"token {self.token}"
-        }
-        self.session = None
-        self.executor = ThreadPoolExecutor(max_workers=10)
+class RequestStatus(Enum):
+    QUEUED = "queued"
+    PROCESSING = "processing"
+    COMPLETED = "completed"
+    FAILED = "failed"
 
-    async def get_authenticated_user_repos(self) -> List[Dict]:
-        """Fetch all repositories (public and private) for the authenticated user."""
-        repos = []
-        page = 1
-        async with aiohttp.ClientSession(headers=self.headers) as session:
-            while True:
-                try:
-                    async with session.get(
-                        f"{self.base_url}/user/repos",
-                        params={
-                            "page": page,
-                            "per_page": 100,
-                            "type": "owner",  # Only repos owned by the user
-                            "sort": "updated"
-                        }
-                    ) as response:
-                        if response.status != 200:
-                            text = await response.text()
-                            raise Exception(f"Failed to fetch repositories: {text}")
+@dataclass
+class QueuedRequest:
+    id: str
+    status: RequestStatus
+    created_at: float
+    started_at: Optional[float] = None
+    completed_at: Optional[float] = None
+    result: Optional[Dict] = None
+    error: Optional[str] = None
+    position_in_queue: Optional[int] = None
 
-                        current_repos = await response.json()
-                        if not current_repos:
-                            break
+class RequestQueue:
+    def __init__(self, max_concurrent: int = 2):
+        self.queue = deque()
+        self.active_requests: Dict[str, QueuedRequest] = {}
+        self.max_concurrent = max_concurrent
+        self.processing_count = 0
+        self.lock = threading.Lock()
+        self._cleanup_threshold = 1000  # Cleanup when we have more than 1000 completed requests
+        
+    def add_request(self) -> QueuedRequest:
+        request_id = str(uuid.uuid4())
+        request = QueuedRequest(
+            id=request_id,
+            status=RequestStatus.QUEUED,
+            created_at=time.time()
+        )
+        
+        with self.lock:
+            self.queue.append(request)
+            self.active_requests[request_id] = request
+            request.position_in_queue = len(self.queue) - 1
+        
+        return request
+    
+    def get_request(self, request_id: str) -> Optional[QueuedRequest]:
+        return self.active_requests.get(request_id)
+    
+    def update_queue_positions(self):
+        """Update position in queue for all queued requests"""
+        with self.lock:
+            queue_position = 0
+            for request_id in self.queue:
+                request = self.active_requests[request_id]
+                if request.status == RequestStatus.QUEUED:
+                    request.position_in_queue = queue_position
+                    queue_position += 1
+    
+    def can_process_next(self) -> bool:
+        return self.processing_count < self.max_concurrent
+    
+    def get_next_request(self) -> Optional[QueuedRequest]:
+        with self.lock:
+            while self.queue:
+                request_id = self.queue[0]
+                request = self.active_requests[request_id]
+                
+                if request.status == RequestStatus.QUEUED:
+                    self.processing_count += 1
+                    request.status = RequestStatus.PROCESSING
+                    request.started_at = time.time()
+                    request.position_in_queue = None
+                    self.update_queue_positions()
+                    return request
+                else:
+                    self.queue.popleft()  # Remove processed requests from queue
+            return None
+    
+    def complete_request(self, request_id: str, result: Dict = None, error: str = None):
+        with self.lock:
+            if request_id in self.active_requests:
+                request = self.active_requests[request_id]
+                request.completed_at = time.time()
+                request.result = result
+                request.error = error
+                request.status = RequestStatus.FAILED if error else RequestStatus.COMPLETED
+                self.processing_count -= 1
+                
+                # Cleanup old completed requests if we've accumulated too many
+                if len(self.active_requests) > self._cleanup_threshold:
+                    self._cleanup_old_requests()
+    
+    def _cleanup_old_requests(self, max_age_hours: int = 24):
+        """Remove completed/failed requests older than max_age_hours"""
+        current_time = time.time()
+        max_age_seconds = max_age_hours * 3600
+        
+        to_remove = []
+        for request_id, request in self.active_requests.items():
+            if request.status in (RequestStatus.COMPLETED, RequestStatus.FAILED):
+                if current_time - request.completed_at > max_age_seconds:
+                    to_remove.append(request_id)
+        
+        for request_id in to_remove:
+            del self.active_requests[request_id]
 
-                        repos.extend(current_repos)
-                        page += 1
-                        logger.info(f"Fetched page {page-1} of repositories")
-                except Exception as e:
-                    logger.error(f"Error fetching repositories: {str(e)}")
-                    raise
-
-        return repos
-
-    def count_file_lines(self, content: str) -> int:
-        """Count the number of lines in a file."""
-        return len(content.splitlines())
-
-    def is_code_file(self, filename: str) -> bool:
-        """Check if the file is a code file based on extension."""
-        code_extensions = {
-            '.py', '.js', '.java', '.cpp', '.c', '.h', '.cs', '.php',
-            '.rb', '.go', '.rs', '.swift', '.kt', '.ts', '.jsx', '.tsx',
-            '.html', '.css', '.scss', '.sass', '.less', '.sql', '.sh',
-            '.bash', '.r', '.m', '.mm', '.scala', '.pl', '.pm'
-        }
-        return any(filename.lower().endswith(ext) for ext in code_extensions)
-
-    async def get_repository_files(self, repo_name: str, session: aiohttp.ClientSession) -> List[Dict]:
-        """Recursively get all files in a repository using async calls."""
-        async def get_contents(path: str = "") -> List[Dict]:
-            try:
-                async with session.get(
-                    f"{self.base_url}/repos/{repo_name}/contents/{path}",
-                    headers=self.headers
-                ) as response:
-                    if response.status != 200:
-                        logger.warning(f"Failed to get contents for {repo_name}/{path}: {response.status}")
-                        return []
-
-                    contents = await response.json()
-                    if not isinstance(contents, list):
-                        return []
-
-                    files = []
-                    tasks = []
-
-                    for item in contents:
-                        if item['type'] == 'file' and self.is_code_file(item['name']):
-                            files.append(item)
-                        elif item['type'] == 'dir':
-                            tasks.append(get_contents(item['path']))
-
-                    if tasks:
-                        subdirectory_files = await asyncio.gather(*tasks, return_exceptions=True)
-                        for subfiles in subdirectory_files:
-                            if isinstance(subfiles, list):  # Only extend if not an exception
-                                files.extend(subfiles)
-
-                    return files
-            except Exception as e:
-                logger.error(f"Error getting contents for {repo_name}/{path}: {str(e)}")
-                return []
-
-        return await get_contents()
-
-    async def process_file(self, file: Dict, session: aiohttp.ClientSession) -> int:
-        """Process a single file and return its line count."""
-        try:
-            async with session.get(file['download_url']) as response:
-                if response.status == 200:
-                    content = await response.text()
-                    return self.count_file_lines(content)
-        except Exception as e:
-            logger.error(f"Error processing file {file['name']}: {str(e)}")
-        return 0
-
-    async def count_repository_lines(self, repo_name: str) -> Dict:
-        """Count lines of code in a repository using async operations."""
-        try:
-            logger.info(f"Processing repository: {repo_name}")
-            async with aiohttp.ClientSession(headers=self.headers) as session:
-                files = await self.get_repository_files(repo_name, session)
-
-                if not files:
-                    logger.info(f"No files found in repository: {repo_name}")
-                    return {
-                        'repository': repo_name,
-                        'total_lines': 0,
-                        'files_processed': 0
-                    }
-
-                # Process files concurrently with a semaphore to limit concurrent requests
-                sem = asyncio.Semaphore(5)  # Limit concurrent file processing
-                async def process_with_semaphore(file):
-                    async with sem:
-                        return await self.process_file(file, session)
-
-                tasks = [process_with_semaphore(file) for file in files]
-                line_counts = await asyncio.gather(*tasks, return_exceptions=True)
-
-                # Filter out exceptions and sum valid line counts
-                valid_counts = [count for count in line_counts if isinstance(count, int)]
-
-                result = {
-                    'repository': repo_name,
-                    'total_lines': sum(valid_counts),
-                    'files_processed': len(valid_counts)
-                }
-                logger.info(f"Repository {repo_name} processed: {result}")
-                return result
-        except Exception as e:
-            logger.error(f"Error processing repository {repo_name}: {str(e)}")
-            return {
-                'repository': repo_name,
-                'total_lines': 0,
-                'files_processed': 0,
-                'error': str(e)
-            }
-
-    async def process_repositories(self, repos: List[Dict]) -> Dict:
-        """Process all repositories concurrently."""
-        # Limit concurrent repository processing
-        sem = asyncio.Semaphore(3)
-
-        async def process_repo_with_semaphore(repo):
-            async with sem:
-                if not repo['fork']:
-                    return await self.count_repository_lines(repo['full_name'])
-                return None
-
-        tasks = [process_repo_with_semaphore(repo) for repo in repos]
-        repo_stats = await asyncio.gather(*tasks)
-
-        total_stats = {
-            'total_lines': 0,
-            'total_files': 0,
-            'repositories_processed': 0,
-            'repository_details': []
-        }
-
-        for stats in repo_stats:
-            if stats is not None:  # Skip None results (forked repos)
-                total_stats['total_lines'] += stats['total_lines']
-                total_stats['total_files'] += stats['files_processed']
-                total_stats['repositories_processed'] += 1
-                total_stats['repository_details'].append(stats)
 
         return total_stats
 
-def is_valid_github_token(token: str) -> bool:
-    """Validate GitHub token format."""
-    # Basic validation for GitHub token format
-    pattern = r'^gh[ops]_[A-Za-z0-9_]{36,255}$'
-    return bool(re.match(pattern, token))
+# Initialize the request queue
+request_queue = RequestQueue(max_concurrent=2)
+
+async def process_request(request: QueuedRequest):
+    """Process a single request"""
+    try:
+        counter = GitHubLOCCounter()
+        repos = await counter.get_authenticated_user_repos()
+        total_stats = await counter.process_repositories(repos)
+        total_stats['execution_time_seconds'] = round(time.time() - request.started_at, 2)
+        request_queue.complete_request(request.id, result=total_stats)
+    except Exception as e:
+        logger.error(f"Error processing request {request.id}: {str(e)}")
+        request_queue.complete_request(request.id, error=str(e))
+
+async def queue_processor():
+    """Background task to process queued requests"""
+    while True:
+        if request_queue.can_process_next():
+            request = request_queue.get_next_request()
+            if request:
+                asyncio.create_task(process_request(request))
+        await asyncio.sleep(1)  # Check queue every second
+
+@app.before_serving
+async def startup():
+    """Start the queue processor when the application starts"""
+    app.queue_processor = asyncio.create_task(queue_processor())
+
+@app.after_serving
+async def shutdown():
+    """Clean up the queue processor when the application shuts down"""
+    app.queue_processor.cancel()
+    try:
+        await app.queue_processor
+    except asyncio.CancelledError:
+        pass
+
+def format_request_status(request: QueuedRequest) -> Dict:
+    """Format the request status for API response"""
+    status_dict = asdict(request)
+    status_dict['status'] = request.status.value
+    
+    # Add estimated wait time for queued requests
+    if request.status == RequestStatus.QUEUED and request.position_in_queue is not None:
+        # Rough estimate: 5 minutes per repository scan, 2 concurrent requests
+        estimated_wait = (request.position_in_queue // 2 + 1) * 5
+        status_dict['estimated_wait_minutes'] = estimated_wait
+    
+    return status_dict
 
 @app.route('/count-my-loc', methods=['POST'])
 async def count_authenticated_user_loc():
+    """Endpoint to initiate a new LOC counting request"""
     try:
-        # Get token from request body
-        request_data = await request.get_json()
-        
-        if not request_data or 'github_token' not in request_data:
-            return jsonify({'error': 'Missing github_token in request body'}), 400
-        
-        token = request_data['github_token']
-        
-        # Validate token format
-        if not is_valid_github_token(token):
-            return jsonify({'error': 'Invalid GitHub token format'}), 400
-
-        start_time = time.time()
-        counter = GitHubLOCCounter(token)
-
-        # Get all repositories for authenticated user
-        repos = await counter.get_authenticated_user_repos()
-        logger.info(f"Found {len(repos)} repositories")
-
-        # Process repositories and get stats
-        total_stats = await counter.process_repositories(repos)
-        total_stats['execution_time_seconds'] = round(time.time() - start_time, 2)
-
-        return jsonify(total_stats)
-
+        request = request_queue.add_request()
+        return jsonify({
+            'request_id': request.id,
+            'status': format_request_status(request)
+        })
     except Exception as e:
-        logger.error(f"Error processing request: {str(e)}")
+        logger.error(f"Error creating request: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
-# Add security headers middleware
-@app.after_request
-def add_security_headers(response):
-    response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
-    response.headers['X-Content-Type-Options'] = 'nosniff'
-    response.headers['X-Frame-Options'] = 'DENY'
-    response.headers['X-XSS-Protection'] = '1; mode=block'
-    return response
+@app.route('/status/<request_id>', methods=['GET'])
+async def get_request_status(request_id: str):
+    """Endpoint to check the status of a specific request"""
+    request = request_queue.get_request(request_id)
+    if not request:
+        return jsonify({'error': 'Request not found'}), 404
+    
+    return jsonify(format_request_status(request))
 
 @app.route('/health', methods=['GET'])
 async def health_check():
-    return jsonify({'status': 'healthy'})
+    """Health check endpoint with queue statistics"""
+    return jsonify({
+        'status': 'healthy',
+        'queue_length': len(request_queue.queue),
+        'active_requests': request_queue.processing_count
+    })
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
