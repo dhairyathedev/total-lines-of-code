@@ -15,6 +15,8 @@ const connection = {
     password: process.env.REDIS_PASSWORD,
 };
 
+const queue = new Queue('count-lines', {connection})
+
 async function cloneRepo(repo, token, userId) {
     try {
         // index.js is in /mnt/main_hdd/Programming/Projects/total-lines-of-code/backend/services/clone-repo
@@ -67,9 +69,10 @@ const worker = new Worker('clone-repo', async (job) => {
         age: 24 * 3600 * 7 // Keep failed jobs for 7 days
     }
 });
-worker.on('completed', (jobId, result) => {
-    console.log(`Job ${jobId} completed with result: ${result}`);
-})
+worker.on('completed', (job) => {
+    queue.add('count-lines', { userId: job.data.userId });
+    console.log(`Clone Job ${job.id} completed successfully`);
+});
 
 worker.on('failed', (job, err) => {
     console.error(`Job ${job.id} failed after ${job.attemptsMade} attempts:`, err);
