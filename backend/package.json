@@ -2,15 +2,18 @@
   "name": "backend",
   "version": "1.0.0",
   "description": "",
-  "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "install-all": "npm install && cd services/api-gateway && npm install && cd ../repository-service && npm install && cd ../clone-service && npm install && cd ../line-counter-service && npm install",
+    "start-all": "npx concurrently \"cd services/api-gateway && npm start\" \"cd services/repository-service && npm start\" \"cd services/clone-service && npm start\" \"cd services/line-counter-service && npm start\""
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "dependencies": {
     "axios": "^1.7.7",
+    "bullmq": "^5.25.3",
+    "concurrently": "^8.0.0",
+    "dotenv": "^16.4.5",
     "express": "^4.21.1"
   }
 }
