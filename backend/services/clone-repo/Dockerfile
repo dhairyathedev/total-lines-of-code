@@ -1,0 +1,14 @@
+FROM node:18-alpine
+
+# Install git
+RUN apk add --no-cache git
+
+WORKDIR /app
+
+COPY package*.json ./
+
+RUN npm install
+
+COPY . .
+
+CMD ["node", "index.js"]

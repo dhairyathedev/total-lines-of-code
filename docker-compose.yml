@@ -1,0 +1,51 @@
+version: '3.8'
+
+services:
+  api:
+    build: 
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "80:5000"
+    environment:
+      - NODE_ENV=production
+      - REDIS_HOST=your-redis-host
+      - REDIS_PORT=6379
+      - REDIS_PASSWORD=your-redis-password
+    volumes:
+      - ./storage:/app/storage
+
+  clone-repo:
+    build: 
+      context: ./services/clone-repo
+      dockerfile: Dockerfile
+    environment:
+      - NODE_ENV=production
+      - REDIS_HOST=your-redis-host
+      - REDIS_PORT=6379
+      - REDIS_PASSWORD=your-redis-password
+    volumes:
+      - ./storage:/app/storage
+
+  count-lines:
+    build: 
+      context: ./services/count-lines
+      dockerfile: Dockerfile
+    environment:
+      - NODE_ENV=production
+      - REDIS_HOST=your-redis-host
+      - REDIS_PORT=6379
+      - REDIS_PASSWORD=your-redis-password
+    volumes:
+      - ./storage:/app/storage
+
+  mailer:
+    build: 
+      context: ./services/mailer
+      dockerfile: Dockerfile
+    environment:
+      - NODE_ENV=production
+      - REDIS_HOST=your-redis-host
+      - REDIS_PORT=6379
+      - REDIS_PASSWORD=your-redis-password
+      - RESEND_API_KEY=your-resend-api-key 
